@@ -2,7 +2,6 @@ import tkinter as tk
 import math
 import random
 from functools import lru_cache
-
 try:
     from PIL import Image, ImageTk
 except ImportError:
@@ -21,73 +20,122 @@ class FinalArtAlgo:
         self.memo = {}
         self.atoms = ["91", "78", "13"]
 
-    def get_random_atoms(self, count):
-        return "".join(random.choices(self.atoms, k=count))
+    def is_valid_atomic_sequence(self, raw_str):
+        """
+        核心规则优化：视觉序列校验！
+        提取算式中所有的纯数字部分拼成一个长字符串，检查它是否能被 91, 78, 13 完整拼出。
+        例如：'9178' -> True  (由 91 + 78 拼成，允许 917+8)
+              '7891' -> True  (由 78 + 91 拼成，允许 789+1)
+              '9173' -> False (73 无效，拒绝 917+3)
+        """
+        digits_only = "".join(filter(str.isdigit, raw_str))
+        if not digits_only:
+            return False
+
+        # 类似“贪吃蛇”匹配：从前向后尝试用 91, 78, 13 消除
+        temp = digits_only
+        while temp:
+            matched = False
+            for atom in self.atoms:
+                if temp.startswith(atom):
+                    temp = temp[len(atom):]
+                    matched = True
+                    break
+            if not matched:
+                return False  # 有无法匹配的残渣数字，判定为非法
+        return True
 
     def wrap(self, text, level):
+        """严格括号层级：( ) -> [ ] -> { }"""
         brackets = [("(", ")"), ("[", "]"), ("{", "}")]
         b_o, b_c = brackets[level % 3]
         return f"{b_o}{text}{b_c}"
 
     def is_complete(self, s):
-        if not s or len(s) < 2: return False
-        if s[-1] in "+-*/": return False
-        if s[0] in "+*/": return False
+        """核心防御：完整性检查 + 视觉规范检查"""
+        if not s or len(s) < 2: 
+            return False
+        # 禁止运算符在开头或结尾
+        if s[-1] in "+-*/" or s[0] in "+*/": 
+            return False
+
+        # 确保括号成对
         counts = [s.count(b) for b in "()[]{}"]
-        return counts[0] == counts[1] and counts[2] == counts[3] and counts[4] == counts[5]
+        if counts[0] != counts[1] or counts[2] != counts[3] or counts[4] != counts[5]:
+            return False
+
+        # 严格执行 91, 78, 13 拼接规则校验
+        if not self.is_valid_atomic_sequence(s):
+            return False
+
+        return True
 
     @lru_cache(maxsize=4096)
     def solve(self, n, level=0):
         n = int(n)
         state_key = (n, level)
-        if state_key in self.memo: return self.memo[state_key]
-        if str(n) in self.atoms: return str(n)
-        if n == 1: return "((91-78)/13)"
-        if n == 0: return "(91-78-13)"
+        if state_key in self.memo: 
+            return self.memo[state_key]
 
-        for count in [1, 2]:
-            for _ in range(60):
-                pool = self.get_random_atoms(count)
+        # 1. 基础出口
+        if str(n) in self.atoms: 
+            return str(n)
+        if n == 1: 
+            return "((91-78)/13)"
+        if n == 0: 
+            return "(91-78-13)"
+
+        # --- 策略 A: 视觉拼凑（支持 917+8, 789+1 等合理拆分） ---
+        for count in [1, 2, 3]:
+            for _ in range(80):
+                # 随机生成原子池
+                pool = "".join(random.choices(self.atoms, k=count))
                 for i in range(1, len(pool)):
                     s1, s2 = pool[:i], pool[i:]
                     try:
                         a, b = int(s1), int(s2)
                         res_body = ""
-                        if a + b == n:
-                            res_body = f"{s1}+{s2}"
-                        elif a - b == n:
-                            res_body = f"{s1}-{s2}"
-                        elif a * b == n:
-                            res_body = f"{s1}*{s2}"
-                        elif b != 0 and a % b == 0 and a // b == n:
-                            res_body = f"{s1}/{s2}"
+                        if a + b == n: res_body = f"{s1}+{s2}"
+                        elif a - b == n: res_body = f"{s1}-{s2}"
+                        elif a * b == n: res_body = f"{s1}*{s2}"
+                        elif b != 0 and a % b == 0 and a // b == n: res_body = f"{s1}/{s2}"
+
                         if res_body:
                             final = self.wrap(res_body, level)
                             if self.is_complete(final):
                                 self.memo[state_key] = final
                                 return final
-                    except:
+                    except: 
                         continue
 
+        # --- 策略 B: 数学降维递归 ---
         bases = [91, 78, 13]
         random.shuffle(bases)
         for base in bases:
             if n > base:
                 m, r = n // base, n % base
                 m_expr = self.solve(m, level + 1)
-                if not self.is_complete(m_expr): continue
+                if not self.is_complete(m_expr): 
+                    continue
+
                 if r == 0:
                     final = self.wrap(f"{base}*{m_expr}", level)
                 else:
                     r_expr = self.solve(r, level + 1)
-                    if not self.is_complete(r_expr): continue
+                    if not self.is_complete(r_expr): 
+                        continue
                     final = self.wrap(f"{base}*{m_expr}+{r_expr}", level)
+
                 if self.is_complete(final):
                     self.memo[state_key] = final
                     return final
 
-        p_expr, o_expr = self.solve(n - 1, level + 1), self.solve(1, level + 1)
-        if not self.is_complete(p_expr): p_expr = "91"
+        # --- 策略 C: 终极保底 ---
+        p_expr = self.solve(n - 1, level + 1)
+        o_expr = self.solve(1, level + 1)
+        if not self.is_complete(p_expr): 
+            p_expr = "91"
+            
         final = self.wrap(f"{p_expr}+{o_expr}", level)
         self.memo[state_key] = final
         return final
@@ -198,8 +246,7 @@ class FrierenGrimoire:
             self.ideal_size = [min(w, 1100), min(h, 900)]
             self.adapt_env()
             self.misty_type(formula, 0)
-        except:
-            pass
+        except: pass
 
     def misty_type(self, text, idx):
         self.res_txt.configure(state=tk.NORMAL)
@@ -219,7 +266,7 @@ class FrierenGrimoire:
         return f'#{int(r1 + (r2 - r1) * t):02x}{int(g1 + (g2 - g1) * t):02x}{int(b1 + (b2 - b1) * t):02x}'
 
     def adapt_env(self):
-        """完全恢复：复杂的边界检测与自动回弹收回逻辑"""
+        """复杂的屏幕边界感应与回弹算法"""
         if self.is_dragging: return
         try:
             import ctypes
@@ -229,8 +276,7 @@ class FrierenGrimoire:
             sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
             iw, ih = self.ideal_size
             MIN_W, MIN_H, MAX_W, MAX_H, M = 480, 380, 1100, 900, 10
-
-            # 获取工作区（避开任务栏）
+            
             try:
                 SPI_GETWORKAREA = 0x0030
                 rect = wintypes.RECT()
@@ -238,29 +284,26 @@ class FrierenGrimoire:
                 L, T, R, B = rect.left + M, rect.top + M, rect.right - M, rect.bottom - M
             except:
                 L, T, R, B = M, M, sw - M, sh - 40 - M
-
+            
             desired_w, desired_h = max(MIN_W, min(iw, MAX_W)), max(MIN_H, min(ih, MAX_H))
-
-            # 屏幕溢出处理
+            
             max_w_screen = R - L
             if desired_w > max_w_screen: desired_w = max(MIN_W, max_w_screen)
-
-            # 宽高比锁定与缩放逻辑
+            
             ratio = desired_w / max(1, iw)
             if ratio < 1.0:
                 desired_h = int(desired_h * (1.0 / max(0.25, ratio)) ** 1.25)
                 desired_h = max(MIN_H, min(desired_h, MAX_H))
-
+            
             EDGE = 30
             near_left, near_top = (cx - L) < EDGE, (cy - T) < EDGE
             near_right, near_bottom = (R - (cx + cw)) < EDGE, (B - (cy + ch)) < EDGE
-
+            
             tx, ty, fw, fh = cx, cy, min(desired_w, R - L), min(desired_h, B - T)
-
-            # 边界吸附与收回计算
+            
             if tx + fw > R: fw = max(MIN_W, R - tx)
             if ty + fh > B: fh = max(MIN_H, B - ty)
-
+            
             if near_left and not near_right:
                 right_edge = cx + cw
                 tx = right_edge - fw
@@ -269,12 +312,12 @@ class FrierenGrimoire:
                 bottom_edge = cy + ch
                 ty = bottom_edge - fh
                 if ty < T: ty = T; fh = max(MIN_H, bottom_edge - ty)
-
+                
             if tx + fw > R: tx = R - fw
             if ty + fh > B: ty = B - fh
             if tx < L: tx = L
             if ty < T: ty = T
-
+            
             self.target_geom = [int(fw), int(fh), int(tx), int(ty)]
         except:
             pass
@@ -292,19 +335,19 @@ class FrierenGrimoire:
         if abs(self.title_size - self.title_target) > 0.1:
             self.title_size += (self.title_target - self.title_size) * 0.12
             self.title_label.configure(font=("Georgia", int(self.title_size), "italic"))
+            
         if abs(self.eq_angle - self.eq_target) > 0.1:
             self.eq_angle += (self.eq_target - self.eq_angle) * 0.2
         self.draw_eq(self.eq_angle)
+        
         self.root.after(16, self.update_loop)
 
     def draw_eq(self, angle):
         rad = math.radians(angle)
         cx, cy, d = 60, 40, 16 * (1.0 - (angle / 90.0) * 0.1)
         cosa, sina = math.cos(rad), math.sin(rad)
-
         def pts(o): return (cx - d * cosa - o * sina, cy - d * sina + o * cosa, cx + d * cosa - o * sina,
                             cy + d * sina + o * cosa)
-
         self.canvas.coords(self.l1, *pts(-6))
         self.canvas.coords(self.l2, *pts(6))
 
