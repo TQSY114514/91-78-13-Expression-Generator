@@ -8,6 +8,10 @@ import threading
 import time
 from bisect import bisect_left, bisect_right
 
+# 解除 Python 3.11+ 的整数字符串转换长度限制 (允许任意位数超大整数计算)
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)
+
 # ====== 开启高分屏 DPI 感知 (彻底解决 Windows 下字体发虚) ======
 if sys.platform == "win32":
     try:
@@ -18,6 +22,11 @@ if sys.platform == "win32":
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+    try:
+        # 设置专属 AppUserModelID，使 Windows 任务栏显示独立满幅图标，不被归为 python.exe
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("google.numericproof.desktop.v1")
+    except Exception:
+        pass
 
 # ====== Claude / Anthropic 暖调学术美学配色 ======
 CLR_BG = "#F8F7F4"          # 经典羊皮纸暖白 (Claude Background)
@@ -56,11 +65,12 @@ class SmoothNumericEntry(tk.Canvas):
     自绘数字输入框：
     - Canvas 自绘光标，使用缓动插值实现平滑移动；
     - 颜色渐变模拟 smooth caret blinking；
-    - 支持数字输入、方向键、Home/End、退格、删除、鼠标定位、
-      拖动选择、Ctrl+A/C/X/V。
+    - 支持数字输入、方向键数值微调 (↑/↓ ±1, Shift+↑/↓ ±10)、
+      撤销重做 (Ctrl+Z / Ctrl+Y)、占位提示、Home/End、退格、删除、
+      鼠标定位、拖动选择、Ctrl+A/C/X/V。
     """
     def __init__(self, master, font, bg, fg, caret_color, select_bg, select_fg,
-                 height=58, **kwargs):
+                 height=58, placeholder="Enter a number…", focus_callback=None, **kwargs):
         super().__init__(
             master, height=height, bg=bg, bd=0, highlightthickness=0,
             takefocus=True, **kwargs
@@ -71,6 +81,8 @@ class SmoothNumericEntry(tk.Canvas):
         self.caret_color = caret_color
         self.select_bg = select_bg
         self.select_fg = select_fg
+        self.placeholder = placeholder
+        self.focus_callback = focus_callback
 
         self.value = ""
         self.caret = 0
@@ -89,6 +101,8 @@ class SmoothNumericEntry(tk.Canvas):
         self._tx_key = None
         self._tx = 12.0
         self.copy_fallback = None   # 无选区时 Ctrl+C 的回退动作（复制结果表达式）
+        self._undo_stack = []
+        self._redo_stack = []
 
         self.bind("<KeyPress>", self._on_key)
         self.bind("<Button-1>", self._on_click)
@@ -106,6 +120,12 @@ class SmoothNumericEntry(tk.Canvas):
         self.bind("<Control-X>", self._cut)
         self.bind("<Control-v>", self._paste)
         self.bind("<Control-V>", self._paste)
+        self.bind("<Control-z>", self._undo)
+        self.bind("<Control-Z>", self._undo)
+        self.bind("<Control-y>", self._redo)
+        self.bind("<Control-Y>", self._redo)
+        self.bind("<Up>", self._on_arrow)
+        self.bind("<Down>", self._on_arrow)
         self.bind("<Return>", self._submit)
         self.bind("<KP_Enter>", self._submit)
         self._redraw()
@@ -114,8 +134,49 @@ class SmoothNumericEntry(tk.Canvas):
     def get(self):
         return self.value
 
+    def _record_undo(self):
+        state = (self.value, self.caret)
+        if not self._undo_stack or self._undo_stack[-1] != state:
+            self._undo_stack.append(state)
+            if len(self._undo_stack) > 60:
+                self._undo_stack.pop(0)
+            self._redo_stack.clear()
+
+    def _undo(self, _event=None):
+        if self._undo_stack:
+            self._redo_stack.append((self.value, self.caret))
+            val, caret = self._undo_stack.pop()
+            self.value = val
+            self.caret = self.anchor = min(len(self.value), caret)
+            self._changed()
+        return "break"
+
+    def _redo(self, _event=None):
+        if self._redo_stack:
+            self._undo_stack.append((self.value, self.caret))
+            val, caret = self._redo_stack.pop()
+            self.value = val
+            self.caret = self.anchor = min(len(self.value), caret)
+            self._changed()
+        return "break"
+
+    def _on_arrow(self, event):
+        self._record_undo()
+        shift = bool(event.state & 0x0001)
+        delta = 10 if shift else 1
+        current = int(self.value) if self.value else 0
+        if event.keysym == "Up":
+            new_val = current + delta
+        else:
+            new_val = max(0, current - delta)
+        self.value = str(new_val)
+        self.caret = self.anchor = len(self.value)
+        self._changed()
+        return "break"
+
     def delete(self, first, last=None):
         # 兼容常见 Entry.delete(0, END) 调用。
+        self._record_undo()
         self.value = ""
         self.caret = self.anchor = 0
         self._changed()
@@ -124,6 +185,7 @@ class SmoothNumericEntry(tk.Canvas):
         text = "".join(ch for ch in str(text) if ch.isdigit())
         if not text:
             return
+        self._record_undo()
         index = self._index(index)
         self._replace_selection("")
         self.value = self.value[:index] + text + self.value[index:]
@@ -200,10 +262,20 @@ class SmoothNumericEntry(tk.Canvas):
         self.focused = True
         self.blink_phase = 0.0
         self._redraw()
+        if self.focus_callback:
+            try:
+                self.focus_callback(True)
+            except Exception:
+                pass
 
     def _on_focus_out(self, _event=None):
         self.focused = False
         self._redraw()
+        if self.focus_callback:
+            try:
+                self.focus_callback(False)
+            except Exception:
+                pass
 
     def _select_all(self, _event=None):
         self.anchor, self.caret = 0, len(self.value)
@@ -222,6 +294,7 @@ class SmoothNumericEntry(tk.Canvas):
     def _cut(self, _event=None):
         self._copy()
         if self._selection()[0] != self._selection()[1]:
+            self._record_undo()
             self._replace_selection("")
             self._changed()
         return "break"
@@ -233,6 +306,7 @@ class SmoothNumericEntry(tk.Canvas):
             return "break"
         pasted = "".join(ch for ch in pasted if ch.isdigit())
         if pasted:
+            self._record_undo()
             self._replace_selection("")
             pos = self.caret
             self.value = self.value[:pos] + pasted + self.value[pos:]
@@ -271,6 +345,7 @@ class SmoothNumericEntry(tk.Canvas):
             return "break"
 
         if key == "BackSpace":
+            self._record_undo()
             if not self._replace_selection(""):
                 if self.caret > 0:
                     self.value = self.value[:self.caret - 1] + self.value[self.caret:]
@@ -280,6 +355,7 @@ class SmoothNumericEntry(tk.Canvas):
             return "break"
 
         if key == "Delete":
+            self._record_undo()
             if not self._replace_selection(""):
                 if self.caret < len(self.value):
                     self.value = self.value[:self.caret] + self.value[self.caret + 1:]
@@ -290,6 +366,7 @@ class SmoothNumericEntry(tk.Canvas):
             return self._submit()
 
         if event.char and event.char.isdigit() and len(event.char) == 1:
+            self._record_undo()
             self._replace_selection("")
             pos = self.caret
             self.value = self.value[:pos] + event.char + self.value[pos:]
@@ -308,11 +385,18 @@ class SmoothNumericEntry(tk.Canvas):
     def _mix_color(a, b, amount):
         a = a.lstrip("#")
         b = b.lstrip("#")
-        vals = [
-            round(int(a[i:i+2], 16) * (1 - amount) + int(b[i:i+2], 16) * amount)
-            for i in (0, 2, 4)
-        ]
-        return "#{:02x}{:02x}{:02x}".format(*vals)
+        if len(a) == 3:
+            a = "".join(c * 2 for c in a)
+        if len(b) == 3:
+            b = "".join(c * 2 for c in b)
+        try:
+            vals = [
+                round(int(a[i:i+2], 16) * (1 - amount) + int(b[i:i+2], 16) * amount)
+                for i in (0, 2, 4)
+            ]
+            return "#{:02x}{:02x}{:02x}".format(*vals)
+        except Exception:
+            return "#" + b
 
     def _on_double(self, _event=None):
         self.dragging = False
@@ -322,7 +406,6 @@ class SmoothNumericEntry(tk.Canvas):
         return "break"
 
     def _caret_x(self):
-        # font.measure 较慢：仅在文本或光标位置变化时重新测量。
         key = (self.value, self.caret)
         if key != self._tx_key:
             self._tx_key = key
@@ -335,7 +418,6 @@ class SmoothNumericEntry(tk.Canvas):
         return self._mix_color(self.bg_color, self.caret_color, amount)
 
     def _redraw(self):
-        # 显式调用 Canvas.delete，避免与输入框兼容接口 delete() 冲突。
         tk.Canvas.delete(self, "all")
         height = max(1, self.winfo_height())
         baseline = height / 2
@@ -347,14 +429,20 @@ class SmoothNumericEntry(tk.Canvas):
         if start != end:
             ex = text_x + self.font.measure(self.value[:end])
             self.create_rectangle(sx, 8, ex, height - 8, fill=self.select_bg, outline="")
-        self.create_text(
-            text_x, baseline, anchor="w", text=self.value,
-            font=self.font, fill=self.fg_color
-        )
-        if start != end:
+        if self.value:
             self.create_text(
-                sx, baseline, anchor="w", text=self.value[start:end],
-                font=self.font, fill=self.select_fg
+                text_x, baseline, anchor="w", text=self.value,
+                font=self.font, fill=self.fg_color
+            )
+            if start != end:
+                self.create_text(
+                    sx, baseline, anchor="w", text=self.value[start:end],
+                    font=self.font, fill=self.select_fg
+                )
+        elif self.placeholder:
+            self.create_text(
+                text_x, baseline, anchor="w", text=self.placeholder,
+                font=self.font, fill=CLR_MUTED
             )
 
         self._caret_item = None
@@ -367,7 +455,6 @@ class SmoothNumericEntry(tk.Canvas):
             )
 
     def _animate(self):
-        # 只有滚动位置变化才整体重绘；光标移动/闪烁只更新一条线。
         target_x = self._caret_x()
         old_scroll = self.scroll_x
         dx = target_x - self.visual_x
@@ -377,7 +464,6 @@ class SmoothNumericEntry(tk.Canvas):
         self.scroll_x = self.scroll_x + ds * 0.24 if abs(ds) > 0.15 else self.target_scroll_x
 
         if self.focused:
-            # phase=0 时最亮：输入、点击后光标立即清晰可见，再平滑淡出/淡入。
             self.blink_phase = (self.blink_phase + 0.11) % (2 * math.pi)
             self.blink_phase_value = 0.5 + 0.5 * math.cos(self.blink_phase)
             if self.scroll_x != old_scroll or self._caret_item is None:
@@ -400,7 +486,6 @@ class SmoothNumericEntry(tk.Canvas):
                 pass
             self._animation_job = None
         super().destroy()
-
 
 class SolveCancelled(Exception):
     """搜索被新的输入取消。"""
@@ -768,21 +853,22 @@ class FinalArtAlgo:
         out = {}
         cands = self._cands
 
-        # 1. 邻近锚点：n = L ± d
-        window = 3000
-        lo = bisect_left(self._lit_values, n - window)
-        hi = bisect_right(self._lit_values, n + window)
-        for idx in range(lo, hi):
-            value, lit = self.literals[idx]
-            d = n - value
-            if d == 0:
-                continue
-            if d > 0:
-                for de in cands(d).values():
-                    _merge(out, lit, de, "+")
-            elif -d < n:
-                for de in cands(-d).values():
-                    _merge(out, lit, de, "-")
+        # 1. 邻近锚点：n = L ± d (仅在 n < 10**8 时有效，大数锚点间距大且无意义)
+        if n < 10 ** 8:
+            window = 3000
+            lo = bisect_left(self._lit_values, n - window)
+            hi = bisect_right(self._lit_values, n + window)
+            for idx in range(lo, hi):
+                value, lit = self.literals[idx]
+                d = n - value
+                if d == 0:
+                    continue
+                if d > 0:
+                    for de in cands(d).values():
+                        _merge(out, lit, de, "+")
+                elif -d < n:
+                    for de in cands(-d).values():
+                        _merge(out, lit, de, "-")
 
         # 2. 因数分解：n = v * (n / v)，v 取表达式短的小数
         if n < 10 ** 7:
@@ -805,7 +891,14 @@ class FinalArtAlgo:
             if 0 < gap < n:
                 plans.append((blen + 2 + self._estimate(q + 1, cache) + self._estimate(gap, cache), b, q + 1, gap, True))
         plans.sort(key=lambda p: p[0])
-        keep = 6 if n < 10 ** 6 else 4
+        if n < 10 ** 6:
+            keep = 6
+        elif n < 10 ** 14:
+            keep = 4
+        elif n < 10 ** 22:
+            keep = 2
+        else:
+            keep = 1
         base_expr = {b: e for _, b, e in self.bases}
         for _, b, q, r, upward in plans[:keep]:
             be = base_expr[b]
@@ -886,14 +979,45 @@ class FinalArtAlgo:
         return visit(tree)
 
 
+def _tokenize_formula(formula):
+    """拆分表达式为 (文本, 标签)，标签包括 'digit', 'op', 'paren'"""
+    tokens = []
+    i = 0
+    n = len(formula)
+    while i < n:
+        c = formula[i]
+        if c.isdigit():
+            start = i
+            while i < n and formula[i].isdigit():
+                i += 1
+            tokens.append((formula[start:i], "digit"))
+        elif c in "+-*/":
+            tokens.append((c, "op"))
+            i += 1
+        elif c in "()":
+            tokens.append((c, "paren"))
+            i += 1
+        else:
+            tokens.append((c, "digit"))
+            i += 1
+    return tokens
+
+
 class FrierenGrimoire:
     """无边框桌面窗口：Claude 的纸感 + Amp 的轻量工具感。"""
 
     def __init__(self, root):
         self.root = root
         self.root.title("Numeric Proof")
-        self.root.overrideredirect(True)
         self.root.configure(bg=CLR_BORDER)
+
+        # 生成并绑定应用图标 (任务栏、Alt+Tab与窗口图标)
+        self._set_app_icon()
+
+        # 纯净无边框 + 任务栏集成（彻底杜绝 DWM 假边框引起的残影与阻尼黑边）
+        self.root.overrideredirect(True)
+        if sys.platform == "win32":
+            self.root.after(10, self._set_app_window)
 
         self.fonts = FontManager(self.root)
         self.algo = None          # 在后台线程中构建，窗口不必等待
@@ -902,34 +1026,127 @@ class FrierenGrimoire:
         self.typing_task = None
         self.anim_task = None
         self.is_dragging = False
+        self._drag_start_mouse_x = 0
+        self._drag_start_mouse_y = 0
+        self._drag_start_win_x = 0
+        self._drag_start_win_y = 0
         self.drag_offset = (0, 0)
         self.eq_angle = 0.0
         self.eq_target = 0.0
         self.type_generation = 0
 
+        # 窗口缩放状态
+        self.is_resizing = False
+        self.resize_start_x = 0
+        self.resize_start_y = 0
+        self.resize_start_w = 720
+        self.resize_start_h = 590
+        self._win_width = 720
+        self._win_height = 590
+
         width, height = 720, 590
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         x, y = (sw - width) // 2, (sh - height) // 2
         self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.root.minsize(600, 500)
+        self.root.minsize(620, 500)
 
         self.setup_ui()
         self._start_worker()
         self.root.bind("<Escape>", lambda _event: self.root.destroy())
         self.root.bind("<Control-Return>", lambda _event: self.solve_logic())
         self.root.bind("<Configure>", self._on_configure)
+        self.root.bind("<Map>", self._on_map)
+        self.root.bind("<ButtonRelease-1>", self._on_global_button_release, add="+")
         self._animate_eq()
+
+    def _set_app_window(self):
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+                GWL_EXSTYLE = -20
+                WS_EX_APPWINDOW = 0x00040000
+                WS_EX_TOOLWINDOW = 0x00000080
+                style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+
+                SWP_NOMOVE = 0x0002
+                SWP_NOSIZE = 0x0001
+                SWP_NOZORDER = 0x0004
+                SWP_FRAMECHANGED = 0x0020
+                user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
+            except Exception:
+                pass
+
+    def _set_app_icon(self):
+        try:
+            import os
+            import tempfile
+            from PIL import Image, ImageDraw, ImageFont, ImageTk
+
+            # 512x512 超采样高清矢量母版：确保抗锯齿边缘极致平滑，杜绝小尺寸发虚
+            master = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(master)
+            draw.rounded_rectangle((0, 0, 511, 511), radius=82, fill="#C87554")
+
+            try:
+                font = ImageFont.trueype("segoeuib.ttf", 260)
+            except Exception:
+                try:
+                    font = ImageFont.truetype("arialbd.ttf", 260)
+                except Exception:
+                    font = ImageFont.load_default()
+
+            text = "NP"
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            tx = (512 - tw) // 2 - bbox[0]
+            ty = (512 - th) // 2 - bbox[1]
+            draw.text((tx, ty), text, font=font, fill="#F8F7F4")
+
+            # 使用高质量 Lanczos 重采样滤波器下采样全套多尺寸
+            sizes = [256, 128, 64, 48, 32, 24, 16]
+            images = [master.resize((s, s), Image.Resampling.LANCZOS) for s in sizes]
+
+            temp_dir = tempfile.gettempdir()
+            ico_path = os.path.join(temp_dir, "numeric_proof.ico")
+            images[0].save(
+                ico_path,
+                format="ICO",
+                append_images=images[1:],
+                sizes=[(s, s) for s in sorted(sizes)]
+            )
+            self.root.iconbitmap(ico_path)
+
+            self._photo_images = [ImageTk.PhotoImage(im) for im in images]
+            self.root.iconphoto(True, *self._photo_images)
+        except Exception:
+            self._photo_images = []
 
     def setup_ui(self):
         # 1px 暖灰外沿代替系统窗口边框，保持无边框视觉。
         self.shell = tk.Frame(self.root, bg=CLR_BG)
         self.shell.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
-        # 自定义顶部栏：可拖动，右侧关闭。
+        # 自定义顶部栏：可拖动，右侧最小化与关闭。
         self.header = tk.Frame(self.shell, bg=CLR_BG, height=42)
         self.header.pack(fill=tk.X, padx=30, pady=(13, 0))
         self.header.pack_propagate(False)
 
+        # 顶部左侧专属印章徽标：采用矢量 Canvas 原生字体绘制，任何 DPI 下均极致锐利
+        self.header_icon = tk.Canvas(
+            self.header, width=22, height=22, bg=CLR_BG,
+            bd=0, highlightthickness=0
+        )
+        self.header_icon.pack(side=tk.LEFT, padx=(0, 9), anchor="center")
+        self.header_icon.create_rectangle(0, 0, 22, 22, fill=CLR_ACCENT, outline="")
+        self.header_icon.create_text(
+            11, 11, text="NP", fill="#F8F7F4",
+            font=(self.fonts.mono, 8, "bold")
+        )
         self.brand = tk.Label(
             self.header, text="N U M E R I C   P R O O F",
             font=(self.fonts.mono, 9, "bold"),
@@ -937,6 +1154,7 @@ class FrierenGrimoire:
         )
         self.brand.pack(side=tk.LEFT, anchor="center")
 
+        # 关闭按钮
         self.close_btn = tk.Label(
             self.header, text="×", font=(self.fonts.serif, 19),
             fg=CLR_MUTED, bg=CLR_BG, padx=8, cursor="hand2"
@@ -946,14 +1164,25 @@ class FrierenGrimoire:
         self.close_btn.bind("<Enter>", lambda _e: self.close_btn.configure(fg=CLR_ACCENT))
         self.close_btn.bind("<Leave>", lambda _e: self.close_btn.configure(fg=CLR_MUTED))
 
-        for widget in (self.header, self.brand):
+        # 最小化按钮
+        self.min_btn = tk.Label(
+            self.header, text="—", font=(self.fonts.mono, 11),
+            fg=CLR_MUTED, bg=CLR_BG, padx=8, cursor="hand2"
+        )
+        self.min_btn.pack(side=tk.RIGHT)
+        self.min_btn.bind("<Button-1>", lambda _e: self.minimize_window())
+        self.min_btn.bind("<Enter>", lambda _e: self.min_btn.configure(fg=CLR_ACCENT))
+        self.min_btn.bind("<Leave>", lambda _e: self.min_btn.configure(fg=CLR_MUTED))
+
+        for widget in (self.header, self.brand, self.header_icon):
             widget.bind("<Button-1>", self.start_drag)
             widget.bind("<B1-Motion>", self.do_drag)
+            widget.bind("<ButtonRelease-1>", self.stop_drag)
 
         tk.Frame(self.shell, bg=CLR_BORDER, height=1).pack(fill=tk.X, padx=30, pady=(7, 0))
 
         self.content = tk.Frame(self.shell, bg=CLR_BG)
-        self.content.pack(fill=tk.BOTH, expand=True, padx=48, pady=(30, 25))
+        self.content.pack(fill=tk.BOTH, expand=True, padx=48, pady=(24, 20))
 
         tk.Label(
             self.content, text="Find a proof.",
@@ -966,49 +1195,67 @@ class FrierenGrimoire:
             text="Construct an expression from the atoms 91, 78 and 13.",
             font=(self.fonts.serif, 11),
             fg=CLR_MUTED, bg=CLR_BG, anchor="w"
-        ).pack(fill=tk.X, pady=(7, 25))
+        ).pack(fill=tk.X, pady=(6, 18))
 
         tk.Label(
             self.content, text="NUMBER",
             font=(self.fonts.mono, 9, "bold"),
             fg=CLR_MUTED, bg=CLR_BG, anchor="w"
-        ).pack(fill=tk.X, pady=(0, 8))
+        ).pack(fill=tk.X, pady=(0, 7))
 
+        # 输入栏框架，支持焦点光环 (Focus Ring)
         input_row = tk.Frame(
             self.content, bg=CLR_SURFACE,
             highlightthickness=1, highlightbackground=CLR_BORDER
         )
         input_row.pack(fill=tk.X)
+        self.input_row = input_row
 
         self.entry = SmoothNumericEntry(
             input_row, font=(self.fonts.mono, 23),
             bg=CLR_SURFACE, fg=CLR_PRIME, caret_color=CLR_ACCENT,
-            select_bg=CLR_SELECT_BG, select_fg=CLR_PRIME, height=58
+            select_bg=CLR_SELECT_BG, select_fg=CLR_PRIME, height=58,
+            placeholder="Enter a number…",
+            focus_callback=self._on_entry_focus
         )
-        self.entry.pack(fill=tk.X, padx=16, pady=12)
+        self.entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(16, 6), pady=6)
         self.entry.bind("<<InputChanged>>", self.handle_input)
         self.entry.bind("<<Submit>>", lambda _event: self.solve_logic())
         self.entry.focus_set()
         self.entry.copy_fallback = self.copy_formula
 
+        # 右侧工具栏：一键清空 ×
+        input_tools = tk.Frame(input_row, bg=CLR_SURFACE)
+        input_tools.pack(side=tk.RIGHT, padx=(0, 14), pady=6)
+
+        self.clear_btn = tk.Label(
+            input_tools, text="×",
+            font=(self.fonts.serif, 17), fg=CLR_MUTED, bg=CLR_SURFACE,
+            cursor="hand2", padx=4
+        )
+        self.clear_btn.pack(side=tk.RIGHT)
+        self.clear_btn.bind("<Button-1>", lambda _e: self.clear_input())
+        self.clear_btn.bind("<Enter>", lambda _e: self.clear_btn.configure(fg=CLR_ACCENT))
+        self.clear_btn.bind("<Leave>", lambda _e: self.clear_btn.configure(fg=CLR_MUTED))
+
         # 轻量等号动效：输入时从水平转向竖直，保留原版的动态反馈。
         self.eq_canvas = tk.Canvas(
-            self.content, width=72, height=42, bg=CLR_BG,
+            self.content, width=72, height=36, bg=CLR_BG,
             highlightthickness=0, bd=0
         )
-        self.eq_canvas.pack(pady=(5, 1))
+        self.eq_canvas.pack(pady=(8, 2))
         self.eq_line_a = self.eq_canvas.create_line(0, 0, 0, 0, fill=CLR_ACCENT, width=2.0, capstyle=tk.ROUND)
         self.eq_line_b = self.eq_canvas.create_line(0, 0, 0, 0, fill=CLR_ACCENT, width=2.0, capstyle=tk.ROUND)
 
         result_head = tk.Frame(self.content, bg=CLR_BG)
-        result_head.pack(fill=tk.X, pady=(5, 9))
+        result_head.pack(fill=tk.X, pady=(4, 8))
         tk.Label(
             result_head, text="EXPRESSION",
             font=(self.fonts.mono, 9, "bold"),
             fg=CLR_MUTED, bg=CLR_BG
         ).pack(side=tk.LEFT)
         tk.Label(
-            result_head, text="CLICK TO COPY",
+            result_head, text="CLICK: FORMULA · RIGHT-CLICK: EQUATION",
             font=(self.fonts.mono, 8),
             fg=CLR_MUTED, bg=CLR_BG
         ).pack(side=tk.RIGHT)
@@ -1026,8 +1273,8 @@ class FrierenGrimoire:
             padx=18, pady=17, cursor="hand2", state=tk.DISABLED
         )
         self.res_txt.pack(fill=tk.BOTH, expand=True)
-        self.res_txt.tag_configure("formula", foreground=CLR_PRIME, justify="left")
         self.res_txt.bind("<Button-1>", self.copy_formula)
+        self.res_txt.bind("<Button-3>", self.copy_formula)
         self._scroll_target = 0.0
         self._scroll_job = None
         self.res_txt.bind("<MouseWheel>", self._smooth_result_scroll)
@@ -1035,7 +1282,7 @@ class FrierenGrimoire:
         self.res_txt.bind("<Button-5>", lambda _e: self._smooth_result_scroll_linux(1))
 
         footer = tk.Frame(self.content, bg=CLR_BG)
-        footer.pack(fill=tk.X, pady=(13, 0))
+        footer.pack(fill=tk.X, pady=(10, 0))
         self.status = tk.Label(
             footer, text="Ready · Enter a number to begin",
             font=(self.fonts.mono, 9), fg=CLR_MUTED,
@@ -1043,21 +1290,98 @@ class FrierenGrimoire:
         )
         self.status.pack(side=tk.LEFT)
 
+        # 右下角无边框窗口缩放手柄 (Resize Grip)
+        self.resize_grip = tk.Canvas(
+            footer, width=14, height=14, bg=CLR_BG,
+            highlightthickness=0, bd=0, cursor="size_nw_se"
+        )
+        self.resize_grip.pack(side=tk.RIGHT, padx=(6, 0))
+        self.resize_grip.create_line(12, 3, 3, 12, fill=CLR_BORDER, width=1.2)
+        self.resize_grip.create_line(12, 7, 7, 12, fill=CLR_BORDER, width=1.2)
+        self.resize_grip.create_line(12, 11, 11, 12, fill=CLR_BORDER, width=1.2)
+        self.resize_grip.bind("<Button-1>", self.start_resize)
+        self.resize_grip.bind("<B1-Motion>", self.do_resize)
+        self.resize_grip.bind("<ButtonRelease-1>", self.stop_resize)
+
         self.copy_button = tk.Label(
             footer, text="Copy  ↗", font=(self.fonts.mono, 9),
             fg=CLR_PRIME, bg=CLR_BG, padx=4, pady=3, cursor="hand2"
         )
         self.copy_button.pack(side=tk.RIGHT)
         self.copy_button.bind("<Button-1>", self.copy_formula)
-        self.copy_button.bind("<Enter>", lambda _e: self.copy_button.configure(fg=CLR_ACCENT))
-        self.copy_button.bind("<Leave>", lambda _e: self.copy_button.configure(fg=CLR_PRIME))
+        self.copy_button.bind("<Button-3>", self.copy_formula)
+
+        def on_copy_enter(_e):
+            self.copy_button.configure(fg=CLR_ACCENT)
+            if self.current_formula:
+                self.status.configure(
+                    text="Left-click: copy formula · Right-click or Shift-click: copy equation",
+                    fg=CLR_ACCENT
+                )
+
+        def on_copy_leave(_e):
+            self.copy_button.configure(fg=CLR_PRIME)
+            text, fg = self._status_state
+            self.status.configure(text=text, fg=fg)
+
+        self.copy_button.bind("<Enter>", on_copy_enter)
+        self.copy_button.bind("<Leave>", on_copy_leave)
+
+    def _on_entry_focus(self, focused):
+        color = CLR_ACCENT if focused else CLR_BORDER
+        self.input_row.configure(highlightbackground=color)
+
+    def clear_input(self):
+        self.entry.delete(0, tk.END)
+        self.entry.focus_set()
+        self.handle_input()
+
+    def minimize_window(self):
+        try:
+            self.min_btn.configure(fg=CLR_ACCENT)
+            self.root.overrideredirect(False)
+            self.root.iconify()
+            self.root.bind("<Map>", self._on_restore)
+        except Exception:
+            pass
+
+    def _on_restore(self, _event=None):
+        if self.root.state() == "normal":
+            self.root.overrideredirect(True)
+            self.root.unbind("<Map>")
+            self.min_btn.configure(fg=CLR_MUTED)
+            self._set_app_window()
+
+    def _on_map(self, _event=None):
+        self.min_btn.configure(fg=CLR_MUTED)
+
+    def start_resize(self, event):
+        self.is_resizing = True
+        self.resize_start_x = event.x_root
+        self.resize_start_y = event.y_root
+        self.resize_start_w = self.root.winfo_width()
+        self.resize_start_h = self.root.winfo_height()
+        return "break"
+
+    def do_resize(self, event):
+        if not getattr(self, "is_resizing", False):
+            return "break"
+        dx = event.x_root - self.resize_start_x
+        dy = event.y_root - self.resize_start_y
+        new_w = max(620, self.resize_start_w + dx)
+        new_h = max(500, self.resize_start_h + dy)
+        self.root.geometry(f"{new_w}x{new_h}")
+        return "break"
+
+    def stop_resize(self, _event=None):
+        self.is_resizing = False
+        return "break" 
 
     def _smooth_result_scroll_linux(self, direction):
         self._queue_result_scroll(direction * 3)
         return "break"
 
     def _smooth_result_scroll(self, event):
-        # Windows delta 通常为 120；触控板的小幅 delta 也能平滑累积。
         units = -event.delta / 120 * 3
         if abs(units) < 0.15:
             units = -1 if event.delta > 0 else 1
@@ -1084,17 +1408,28 @@ class FrierenGrimoire:
         self._scroll_job = self.root.after(16, self._animate_result_scroll)
 
     def start_drag(self, event):
+        self._drag_offset_x = event.x_root - self.root.winfo_x()
+        self._drag_offset_y = event.y_root - self.root.winfo_y()
         self.is_dragging = True
-        self.drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
+        return "break"
 
     def do_drag(self, event):
-        if self.is_dragging:
-            x = event.x_root - self.drag_offset[0]
-            y = event.y_root - self.drag_offset[1]
-            self.root.geometry(f"+{x}+{y}")
+        if not getattr(self, "is_dragging", False):
+            return "break"
+        x = event.x_root - self._drag_offset_x
+        y = event.y_root - self._drag_offset_y
+        self.root.geometry(f"+{x}+{y}")
+        return "break"
+
+    def stop_drag(self, _event=None):
+        self.is_dragging = False
+        return "break"
+
+    def _on_global_button_release(self, _event=None):
+        self.is_dragging = False
+        self.is_resizing = False
 
     def _on_configure(self, _event=None):
-        # 保留钩子供后续响应式布局使用；不做边缘检测或自动回弹。
         pass
 
     # ------------------------------------------------------------ 状态栏
@@ -1137,7 +1472,6 @@ class FrierenGrimoire:
                 continue
 
             def stale(rid=req_id):
-                # 有更新的输入到来时，立刻放弃当前搜索。
                 return self._req is not None or rid != self._req_id
 
             t0 = time.perf_counter()
@@ -1196,6 +1530,7 @@ class FrierenGrimoire:
             else:
                 self.current_formula = formula
                 self._animate_formula(formula)
+
                 took = f"{ms:.0f} ms" if ms >= 1 else "<1 ms"
                 self._set_status(
                     f"Constructed · {len(formula)} characters · {took}", CLR_ACCENT
@@ -1214,7 +1549,6 @@ class FrierenGrimoire:
         self._start_eq()
         if self._task:
             self.root.after_cancel(self._task)
-        # 求解在后台线程，防抖只需很短，输入几乎实时出结果。
         self._task = self.root.after(35, self.solve_logic)
 
     def solve_logic(self):
@@ -1231,28 +1565,39 @@ class FrierenGrimoire:
             self.eq_target = 0.0
             self._start_eq()
             return
-        if len(raw) > 15:
-            self._cancel_pending()
-            self.current_formula = ""
-            self._show_formula("")
-            self._set_status("Please enter at most 15 digits.", CLR_ACCENT)
-            return
         self._submit(int(raw))
 
-    # ------------------------------------------------------------ 结果显示
+    # ------------------------------------------------------------ 结果展示与语法着色
     def _stop_typing(self):
         self.type_generation += 1
         if self.typing_task:
             self.root.after_cancel(self.typing_task)
             self.typing_task = None
 
-    def _set_result_text(self, text):
+    def _apply_font_size_for(self, length):
+        if length <= 24:
+            size, op_weight = 17, "bold"
+        elif length <= 50:
+            size, op_weight = 13, "bold"
+        else:
+            size, op_weight = 11, "bold"
+        base_font = (self.fonts.mono, size)
+        bold_font = (self.fonts.mono, size, op_weight)
+        self.res_txt.configure(font=base_font)
+        self.res_txt.tag_configure("digit", foreground=CLR_PRIME, font=base_font)
+        self.res_txt.tag_configure("op", foreground=CLR_ACCENT, font=bold_font)
+        self.res_txt.tag_configure("paren", foreground=CLR_MUTED, font=base_font)
+
+    def _set_result_text(self, formula):
         self._scroll_target = 0.0
         self.res_txt.yview_moveto(0.0)
         self.res_txt.configure(state=tk.NORMAL)
         self.res_txt.delete("1.0", tk.END)
-        if text:
-            self.res_txt.insert(tk.END, text, "formula")
+        if formula:
+            self._apply_font_size_for(len(formula))
+            tokens = _tokenize_formula(formula)
+            for text, tag in tokens:
+                self.res_txt.insert(tk.END, text, tag)
         self.res_txt.configure(state=tk.DISABLED)
 
     def _show_formula(self, formula):
@@ -1260,21 +1605,30 @@ class FrierenGrimoire:
         self._set_result_text(formula)
 
     def _animate_formula(self, formula):
-        """短表达式直接显示；长表达式约 10 帧内显影完毕，不拖慢连续输入。"""
+        """短表达式直接显示；长表达式平滑显影，带细致语法着色。"""
         self._stop_typing()
         if len(formula) <= 16:
             self._set_result_text(formula)
             return
         generation = self.type_generation
-        self._set_result_text("")
+        self._scroll_target = 0.0
+        self.res_txt.yview_moveto(0.0)
+        self.res_txt.configure(state=tk.NORMAL)
+        self.res_txt.delete("1.0", tk.END)
+        self._apply_font_size_for(len(formula))
+        self.res_txt.configure(state=tk.DISABLED)
+
         step = -(-len(formula) // 10)
 
         def reveal(index=0):
             if generation != self.type_generation:
                 return
             end = min(len(formula), index + step)
+            chunk = formula[index:end]
+            tokens = _tokenize_formula(chunk)
             self.res_txt.configure(state=tk.NORMAL)
-            self.res_txt.insert(tk.END, formula[index:end], "formula")
+            for text, tag in tokens:
+                self.res_txt.insert(tk.END, text, tag)
             self.res_txt.configure(state=tk.DISABLED)
             if end < len(formula):
                 self.typing_task = self.root.after(14, lambda: reveal(end))
@@ -1289,7 +1643,6 @@ class FrierenGrimoire:
             self._animate_eq()
 
     def _animate_eq(self):
-        # 平滑缓动；到位后停止调度，空闲时不再占用 CPU。
         delta = self.eq_target - self.eq_angle
         if abs(delta) > 0.12:
             self.eq_angle += delta * 0.20
@@ -1297,7 +1650,7 @@ class FrierenGrimoire:
             self.eq_angle = self.eq_target
 
         angle = math.radians(self.eq_angle)
-        cx, cy = 36, 21
+        cx, cy = 36, 18
         half = 12
         offset = 4.5
         cos_a, sin_a = math.cos(angle), math.sin(angle)
@@ -1314,17 +1667,32 @@ class FrierenGrimoire:
         else:
             self.anim_task = None
 
-    # ------------------------------------------------------------ 复制
-    def copy_formula(self, _event=None):
+    # ------------------------------------------------------------ 双模复制 (左键算式 · 右键/Shift等式)
+    def copy_formula(self, event=None):
         if not self.current_formula:
             return
+        is_equation = False
+        if event is not None:
+            if getattr(event, "num", None) == 3 or (getattr(event, "state", 0) & 0x0001):
+                is_equation = True
+
+        raw = self._digits(self.entry.get())
+        if is_equation and raw:
+            text_to_copy = f"{raw} = {self.current_formula}"
+            status_text = f"Equation copied: {raw} = … ✓"
+            button_text = "Equation Copied! ✓"
+        else:
+            text_to_copy = self.current_formula
+            status_text = "Formula copied to clipboard ✓"
+            button_text = "Formula Copied! ✓"
+
         self.root.clipboard_clear()
-        self.root.clipboard_append(self.current_formula)
-        self._set_status("Copied to clipboard ✓", CLR_ACCENT, remember=False)
-        self.copy_button.configure(text="Copied! ✓", fg=CLR_ACCENT)
+        self.root.clipboard_append(text_to_copy)
+        self._set_status(status_text, CLR_ACCENT, remember=False)
+        self.copy_button.configure(text=button_text, fg=CLR_ACCENT)
         if getattr(self, "_copy_reset_job", None):
             self.root.after_cancel(self._copy_reset_job)
-        self._copy_reset_job = self.root.after(1500, self._reset_copy_feedback)
+        self._copy_reset_job = self.root.after(1600, self._reset_copy_feedback)
 
     def _reset_copy_feedback(self):
         self._copy_reset_job = None
