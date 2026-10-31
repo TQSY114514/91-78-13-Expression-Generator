@@ -1,7 +1,12 @@
 import tkinter as tk
 from tkinter import font as tkfont
 import itertools
+import math
+import queue
 import sys
+import threading
+import time
+from bisect import bisect_left, bisect_right
 
 # ====== 开启高分屏 DPI 感知 (彻底解决 Windows 下字体发虚) ======
 if sys.platform == "win32":
@@ -21,6 +26,7 @@ CLR_PRIME = "#20201E"       # 深炭黑墨水色 (Claude Primary Text)
 CLR_ACCENT = "#C87554"      # 标志性赤陶暖橙 (Claude Terracotta Accent)
 CLR_MUTED = "#77766F"       # 柔和石板灰 (副标题/提示语)
 CLR_BORDER = "#E3E1DB"      # 极细微暖色描边
+CLR_SELECT_BG = "#E8DFD5"   # 柔和暖调学术选区背景 (Claude Selection Tint)
 
 
 class FontManager:
@@ -76,9 +82,17 @@ class SmoothNumericEntry(tk.Canvas):
         self.dragging = False
         self.blink_phase = 0.0
         self._animation_job = None
+        self.blink_phase_value = 1.0
+        self._caret_item = None
+        self._caret_fill = None
+        self._baseline = 0.0
+        self._tx_key = None
+        self._tx = 12.0
+        self.copy_fallback = None   # 无选区时 Ctrl+C 的回退动作（复制结果表达式）
 
         self.bind("<KeyPress>", self._on_key)
         self.bind("<Button-1>", self._on_click)
+        self.bind("<Double-Button-1>", self._on_double)
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<ButtonRelease-1>", self._on_release)
         self.bind("<FocusIn>", self._on_focus_in)
@@ -154,6 +168,9 @@ class SmoothNumericEntry(tk.Canvas):
         content_x = x + self.scroll_x - 12
         if content_x <= 0:
             return 0
+        total_w = self.font.measure(self.value)
+        if content_x >= total_w:
+            return len(self.value)
         for i in range(len(self.value) + 1):
             left = self.font.measure(self.value[:i])
             right = self.font.measure(self.value[:i + 1])
@@ -166,6 +183,7 @@ class SmoothNumericEntry(tk.Canvas):
         self.caret = self.anchor = self._x_to_index(event.x)
         self.dragging = True
         self.blink_phase = 0.0
+        self.blink_phase_value = 1.0
         self.target_scroll_x = self._desired_scroll()
         self._redraw()
 
@@ -197,6 +215,8 @@ class SmoothNumericEntry(tk.Canvas):
         if start != end:
             self.clipboard_clear()
             self.clipboard_append(self.value[start:end])
+        elif self.copy_fallback is not None:
+            self.copy_fallback()
         return "break"
 
     def _cut(self, _event=None):
@@ -274,6 +294,8 @@ class SmoothNumericEntry(tk.Canvas):
             pos = self.caret
             self.value = self.value[:pos] + event.char + self.value[pos:]
             self.caret = self.anchor = pos + 1
+            self.blink_phase = 0.0
+            self.blink_phase_value = 1.0
             self._changed()
             return "break"
 
@@ -292,341 +314,561 @@ class SmoothNumericEntry(tk.Canvas):
         ]
         return "#{:02x}{:02x}{:02x}".format(*vals)
 
+    def _on_double(self, _event=None):
+        self.dragging = False
+        self.anchor, self.caret = 0, len(self.value)
+        self.blink_phase = 0.0
+        self._redraw()
+        return "break"
+
+    def _caret_x(self):
+        # font.measure 较慢：仅在文本或光标位置变化时重新测量。
+        key = (self.value, self.caret)
+        if key != self._tx_key:
+            self._tx_key = key
+            self._tx = 12 + self.font.measure(self.value[:self.caret])
+        return self._tx
+
+    def _caret_color(self):
+        amount = 0.25 + 0.75 * self.blink_phase_value
+        amount = round(amount * 24) / 24   # 量化：颜色没变就不必重绘
+        return self._mix_color(self.bg_color, self.caret_color, amount)
+
     def _redraw(self):
         # 显式调用 Canvas.delete，避免与输入框兼容接口 delete() 冲突。
         tk.Canvas.delete(self, "all")
         height = max(1, self.winfo_height())
         baseline = height / 2
+        self._baseline = baseline
         text_x = 12 - self.scroll_x
 
         start, end = self._selection()
+        sx = text_x + self.font.measure(self.value[:start]) if start != end else 0
         if start != end:
-            sx = text_x + self.font.measure(self.value[:start])
             ex = text_x + self.font.measure(self.value[:end])
-            self.create_rectangle(
-                sx, 8, ex, height - 8, fill=self.select_bg, outline=""
-            )
+            self.create_rectangle(sx, 8, ex, height - 8, fill=self.select_bg, outline="")
         self.create_text(
             text_x, baseline, anchor="w", text=self.value,
             font=self.font, fill=self.fg_color
         )
         if start != end:
-            sx = text_x + self.font.measure(self.value[:start])
-            selected = self.value[start:end]
             self.create_text(
-                sx, baseline, anchor="w", text=selected,
+                sx, baseline, anchor="w", text=self.value[start:end],
                 font=self.font, fill=self.select_fg
             )
 
+        self._caret_item = None
         if self.focused:
-            caret_color = self._mix_color(
-                self.bg_color, self.caret_color, 0.25 + 0.75 * getattr(self, 'blink_phase_value', 0.0)
-            )
             cx = self.visual_x - self.scroll_x
-            self.create_line(
+            self._caret_fill = self._caret_color()
+            self._caret_item = self.create_line(
                 cx, baseline - 15, cx, baseline + 15,
-                fill=caret_color, width=1.6
+                fill=self._caret_fill, width=1.6
             )
 
     def _animate(self):
-        # 约 60fps 的缓动：位置追随目标，闪烁使用连续正弦曲线。
-        import math
-        target_x = 12 + self.font.measure(self.value[:self.caret])
-        self.visual_x += (target_x - self.visual_x) * 0.32
-        self.scroll_x += (self.target_scroll_x - self.scroll_x) * 0.24
-        if abs(target_x - self.visual_x) < 0.15:
-            self.visual_x = target_x
-        if abs(self.target_scroll_x - self.scroll_x) < 0.15:
-            self.scroll_x = self.target_scroll_x
+        # 只有滚动位置变化才整体重绘；光标移动/闪烁只更新一条线。
+        target_x = self._caret_x()
+        old_scroll = self.scroll_x
+        dx = target_x - self.visual_x
+        ds = self.target_scroll_x - self.scroll_x
+        moving = abs(dx) > 0.15 or abs(ds) > 0.15
+        self.visual_x = self.visual_x + dx * 0.32 if abs(dx) > 0.15 else target_x
+        self.scroll_x = self.scroll_x + ds * 0.24 if abs(ds) > 0.15 else self.target_scroll_x
 
         if self.focused:
-            self.blink_phase = (self.blink_phase + 0.055) % (2 * math.pi)
-            # 从低亮度平滑过渡到高亮度，再平滑淡出。
-            self.blink_phase_value = 0.5 - 0.5 * math.cos(self.blink_phase)
-            self.blink_phase = self.blink_phase
-            self._redraw()
-        else:
-            self.blink_phase_value = 0.0
-            self._redraw()
-        self._animation_job = self.after(16, self._animate)
+            # phase=0 时最亮：输入、点击后光标立即清晰可见，再平滑淡出/淡入。
+            self.blink_phase = (self.blink_phase + 0.11) % (2 * math.pi)
+            self.blink_phase_value = 0.5 + 0.5 * math.cos(self.blink_phase)
+            if self.scroll_x != old_scroll or self._caret_item is None:
+                self._redraw()
+            else:
+                cx = self.visual_x - self.scroll_x
+                self.coords(self._caret_item, cx, self._baseline - 15, cx, self._baseline + 15)
+                fill = self._caret_color()
+                if fill != self._caret_fill:
+                    self.itemconfigure(self._caret_item, fill=fill)
+                    self._caret_fill = fill
+        delay = 16 if moving else (33 if self.focused else 120)
+        self._animation_job = self.after(delay, self._animate)
+
+    def destroy(self):
+        if self._animation_job is not None:
+            try:
+                self.after_cancel(self._animation_job)
+            except tk.TclError:
+                pass
+            self._animation_job = None
+        super().destroy()
 
 
-class _ProofExpr:
-    """不可变的四则运算表达式树节点。"""
-    __slots__ = ("value", "op", "left", "right", "literal", "_rendered")
+class SolveCancelled(Exception):
+    """搜索被新的输入取消。"""
 
-    PRECEDENCE = {"+": 1, "-": 1, "*": 2, "/": 2}
 
-    def __init__(self, value, op=None, left=None, right=None, literal=None):
-        self.value = int(value)
+# 数字拆分规则：去掉运算符后的数字流必须恰好是 91、78、13 的顺序拼接，
+# 但每个操作数可以在原子中间断开（如 9*1、137*8）。
+# 因此每个子表达式带“对齐类型”：
+#   st: 'A' 从原子边界开始；否则以某原子的第二位数字（'1'/'8'/'3'）开头
+#   en: 'A' 在原子边界结束；否则结尾留着某原子的第一位数字（'9'/'7'/'1'），下一段必须补全
+# 两段相接合法 <=> _REQ[left.en] == right.st。
+_REQ = {"A": "A", "9": "1", "7": "8", "1": "3"}
+_ATOMS = ("91", "78", "13")
+
+
+class _Expr:
+    """
+    表达式树节点。叶子是一段连续数字；运算符连接左右两段（左段数字在前）。
+
+    kind: "a" 数字叶子, "s" 加减链, "m" 乘除链。
+    length/parens 是最终打印形式的字符数/括号数，对子树可加，所以搜索时无需拼字符串。
+    hd: 乘除链按打印顺序是否含 "/"（决定能否作为除数内联）。
+    """
+    __slots__ = ("value", "kind", "op", "left", "right", "literal",
+                 "length", "parens", "st", "en", "hd")
+
+    def __init__(self, value, kind, op, left, right, literal,
+                 length, parens, st, en, hd):
+        self.value = value
+        self.kind = kind
         self.op = op
         self.left = left
         self.right = right
         self.literal = literal
-        self._rendered = None
+        self.length = length
+        self.parens = parens
+        self.st = st
+        self.en = en
+        self.hd = hd
 
     @classmethod
-    def atom(cls, literal):
-        return cls(int(literal), literal=str(literal))
+    def leaf(cls, digits, st="A", en="A"):
+        return cls(int(digits), "a", None, None, None, digits, len(digits), 0, st, en, False)
 
-    @classmethod
-    def combine(cls, op, left, right):
-        a, b = left.value, right.value
-        if op == "+":
-            value = a + b
-        elif op == "-":
-            value = a - b
-        elif op == "*":
-            value = a * b
-        elif op == "/":
-            if b == 0 or a % b != 0:
-                return None
-            value = a // b
+    # ------------------------------------------------------------ 输出
+    # 打印严格保持叶子的原始数字顺序（否则会破坏 9*1 这类跨原子的拆分）。
+    def _terms(self, sign, out):
+        if self.kind == "s":
+            self.left._terms(sign, out)
+            self.right._terms(sign if self.op == "+" else -sign, out)
         else:
-            raise ValueError(f"Unknown operator: {op}")
-        return cls(value, op=op, left=left, right=right)
+            out.append((sign, self))
 
-    def render(self, parent_op=None, side=None):
-        if self._rendered is None:
-            if self.op is None:
-                self._rendered = self.literal
-            else:
-                self._rendered = (
-                    self.left.render(self.op, "left")
-                    + self.op
-                    + self.right.render(self.op, "right")
-                )
-        text = self._rendered
-        if parent_op is None or self.op is None:
-            return text
+    def _items(self):
+        """乘除链按顺序展开为 [(运算符, 文本)]，首项运算符固定为 '*' 占位。"""
+        items = self.left._operand_items(False)
+        items += self.right._operand_items(self.op == "/")
+        return items
 
-        own_precedence = self.PRECEDENCE[self.op]
-        parent_precedence = self.PRECEDENCE[parent_op]
-        needs_parentheses = own_precedence < parent_precedence
-
-        if own_precedence == parent_precedence and side == "right":
-            # 同优先级时，只有这些右子树不能直接按左结合方式展开。
-            if parent_op == "+" and self.op == "-":
-                needs_parentheses = True
-            elif parent_op == "-" and self.op in ("+", "-"):
-                needs_parentheses = True
-            elif parent_op == "*" and self.op == "/":
-                needs_parentheses = True
-            elif parent_op == "/" and self.op in ("*", "/"):
-                needs_parentheses = True
-
-        return f"({text})" if needs_parentheses else text
-
-    def score(self):
+    def _operand_items(self, invert):
+        if self.kind == "m" and (not invert or not self.hd):
+            items = self._items()
+            if invert:  # a/(b*c) -> a/b/c（此处 b*c 内只有乘号，翻转后全是除号）
+                items = [("*" if op == "/" else "/", t) for op, t in items]
+            return items
         text = self.render()
-        return (
-            len(text),
-            text.count("("),
-            self.operator_count(),
-            text,
-        )
+        if self.kind != "a":
+            text = "(" + text + ")"
+        return [("/" if invert else "*", text)]
 
-    def operator_count(self):
-        if self.op is None:
-            return 0
-        return 1 + self.left.operator_count() + self.right.operator_count()
-
-    def digit_stream(self):
-        if self.op is None:
+    def render(self):
+        kind = self.kind
+        if kind == "a":
             return self.literal
-        return self.left.digit_stream() + self.right.digit_stream()
+        if kind == "s":
+            terms = []
+            self._terms(1, terms)
+            out = terms[0][1].render()
+            for sign, node in terms[1:]:
+                out += ("+" if sign > 0 else "-") + node.render()
+            return out
+        items = self._items()
+        return items[0][1] + "".join(op + t for op, t in items[1:])
+
+
+def _combine(left, right, op):
+    """(value, kind, length, parens, hd)；不合法（负数/不整除/除零）返回 None。"""
+    a, b = left.value, right.value
+    if op == "+":
+        value, kind = a + b, "s"
+    elif op == "-":
+        if a < b:
+            return None
+        value, kind = a - b, "s"
+    elif op == "*":
+        value, kind = a * b, "m"
+    else:
+        if b == 0 or a % b:
+            return None
+        value, kind = a // b, "m"
+    length = left.length + right.length + 1
+    parens = left.parens + right.parens
+    hd = False
+    if kind == "m":
+        if left.kind == "s":
+            length += 2
+            parens += 1
+        if right.kind == "s" or (op == "/" and right.kind == "m" and right.hd):
+            length += 2
+            parens += 1
+        hd = op == "/" or (left.kind == "m" and left.hd) or (right.kind == "m" and right.hd)
+    return value, kind, length, parens, hd
+
+
+def _make(left, right, op, info):
+    value, kind, length, parens, hd = info
+    return _Expr(value, kind, op, left, right, None, length, parens, left.st, right.en, hd)
+
+
+def _merge(out, left, right, op):
+    """out 的键为 kind（调用方保证候选数值相同）。"""
+    info = _combine(left, right, op)
+    if info is None:
+        return
+    old = out.get(info[1])
+    if old is None or (info[2], info[3]) < (old.length, old.parens):
+        out[info[1]] = _make(left, right, op, info)
+
+
+def _better(old, expr):
+    return old is None or (expr.length, expr.parens) < (old.length, old.parens)
 
 
 class FinalArtAlgo:
     """
     用 91、78、13 构造非负整数表达式。
 
-    核心改动：
-    1. 用表达式树计算和保存候选，不在递归过程中拼接括号。
-    2. 用区间 DP 穷举最多 5 个原子的所有二叉四则表达式。
-    3. 每个数值按根运算符分别保留最优表达式，避免上下文括号成本被错误剪枝。
-    4. 对更大的目标，再用多基底商/余数分解，并比较全部候选。
-    5. 最终统一按运算优先级和左右结合性生成最少必要括号。
-
-    “最多 5 个原子”的 DP 部分是精确穷举；更大数字的递归分解是启发式搜索，
-    不宣称对任意大整数都能保证全局最短。
+    - 数位级 DP：枚举所有“可成为某合法数字流子串”的数字段作为操作数（支持 9*1、137*8
+      这类跨原子拆分），带对齐类型组合，确保拼合后去掉符号仍严格由 91、78、13 组成。
+    - 更大的数：字面量/紧凑乘积邻近、小因数分解、多基底商余/补数搜索（确定性剪枝）。
+    - 打印按数字顺序展开链式运算，只保留必要括号。
+    - 每个结果由独立 AST 求值器复核（除法逐步整除），并校验数字流。
     """
 
+    VALUE_CAP = 10 ** 10
+
     def __init__(self):
-        self.atoms = ("91", "78", "13")
-        self.atom_values = {int(x): x for x in self.atoms}
-        self.max_exact_atoms = 5
-        self.value_limit = 10**18
-        self.exact_cache = self._build_exact_cache()
-        self._augment_small_number_cache()
+        self.atoms = _ATOMS
+        self.atom_values = {int(x): x for x in _ATOMS}
+        self._aligned_lits = self._build_aligned_literals()
+        self._leaves = self._build_leaves(8)
+        self._bank = {}
+        self.exact_cache = {}
         self.memo = {}
+        self._should_cancel = None
+        self._enrich_started = False
+
+        # 首屏构建：1~5 位完整层 + 6 位完整对齐层（约 180ms，在后台 worker 线程中先于窗口完成）
+        self._extend_bank(5, self._bank)
+        self._bank[6] = self._build_aligned_layer(6, self._bank)
+        self._refresh_tables(self._bank)
+
+    # ------------------------------------------------------------ 构建
+    @staticmethod
+    def _build_aligned_literals():
+        lits = []
+        for length in (1, 2, 3, 4):
+            for seq in itertools.product(_ATOMS, repeat=length):
+                s = "".join(seq)
+                lits.append((int(s), _Expr.leaf(s)))
+        lits.sort(key=lambda x: x[0])
+        return lits
 
     @staticmethod
-    def _state_key(expr):
-        # 同一数值但不同根运算符，在父节点中可能需要不同括号，不能互相覆盖。
-        return expr.op
+    def _build_leaves(max_digits):
+        """所有合法数字流的子串，连同其对齐类型，按位数分组。"""
+        found = set()
+        for k in range(1, (max_digits + 1) // 2 + 1):
+            for seq in itertools.product(_ATOMS, repeat=k):
+                s = "".join(seq)
+                for i in range(len(s)):
+                    for j in range(i + 1, min(len(s), i + max_digits) + 1):
+                        st = "A" if i % 2 == 0 else s[i]
+                        en = "A" if j % 2 == 0 else s[j - 1]
+                        found.add((s[i:j], st, en))
+        by_len = {}
+        for digits, st, en in sorted(found):
+            by_len.setdefault(len(digits), []).append((digits, st, en))
+        return by_len
 
-    @staticmethod
-    def _keep_best(bucket, expr):
-        old = bucket.get(expr.op)
-        if old is None or expr.score() < old.score():
-            bucket[expr.op] = expr
+    def _extend_bank(self, upto, bank):
+        for d in range(1, upto + 1):
+            if d not in bank:
+                bank[d] = self._build_bank_layer(d, bank)
 
-    def _build_exact_cache(self):
-        """对 1~5 个原子的每一种有序序列做区间 DP。"""
+    def _build_bank_layer(self, d, bank):
+        cap = self.VALUE_CAP
+        layer = {}
+        for digits, st, en in self._leaves.get(d, ()):
+            e = _Expr.leaf(digits, st, en)
+            if e.value <= cap:
+                layer[(e.value, "a", st, en)] = e
+        for d1 in range(1, d):
+            d2 = d - d1
+            by_start = {}
+            for e in bank[d2].values():
+                by_start.setdefault(e.st, []).append(e)
+            for left in list(bank[d1].values()):
+                rights = by_start.get(_REQ[left.en])
+                if not rights:
+                    continue
+                for right in rights:
+                    for op in ("+", "-", "*", "/"):
+                        info = _combine(left, right, op)
+                        if info is None or info[0] > cap:
+                            continue
+                        key = (info[0], info[1], left.st, right.en)
+                        old = layer.get(key)
+                        if old is None or (info[2], info[3]) < (old.length, old.parens):
+                            layer[key] = _make(left, right, op, info)
+        return layer
+
+    def _build_aligned_layer(self, d, bank, pairs=None, max_extra=None):
+        """只构建首尾均对齐 (st='A', en='A') 的偶数位层，省去不会复用的中间边界状态。"""
+        cap = self.VALUE_CAP
+        layer = {}
+        for digits, st, en in self._leaves.get(d, ()):
+            if st == "A" and en == "A":
+                e = _Expr.leaf(digits, "A", "A")
+                if e.value <= cap:
+                    layer[(e.value, "a", "A", "A")] = e
+        if pairs is None:
+            pairs = [(d1, d - d1) for d1 in range(1, d)]
+        for d1, d2 in pairs:
+            lim1 = d1 + max_extra if max_extra is not None else 999
+            lim2 = d2 + max_extra if max_extra is not None else 999
+            by_start = {}
+            for e in bank[d2].values():
+                if e.en == "A" and e.length <= lim2:
+                    by_start.setdefault(e.st, []).append(e)
+            for left in bank[d1].values():
+                if left.st != "A" or left.length > lim1:
+                    continue
+                for right in by_start.get(_REQ[left.en], ()):
+                    for op in ("+", "-", "*", "/"):
+                        info = _combine(left, right, op)
+                        if info is None or info[0] > cap:
+                            continue
+                        key = (info[0], info[1], "A", "A")
+                        old = layer.get(key)
+                        if old is None or (info[2], info[3]) < (old.length, old.parens):
+                            layer[key] = _make(left, right, op, info)
+        return layer
+
+    def _refresh_tables(self, bank):
+        cache = self._make_cache(bank)
+        divisors = self._make_divisors(cache)
+        bases, anchors = self._make_bases_and_anchors(cache)
+        self._cheap_divisors = divisors
+        self.bases = bases
+        self.literals = anchors
+        self._lit_values = [v for v, _ in anchors]
+        self.exact_cache = cache
+
+    def _make_cache(self, bank):
+        """只取首尾都对齐的表达式作为可复用的构件。"""
         cache = {}
-        for count in range(1, self.max_exact_atoms + 1):
-            for sequence in itertools.product(self.atoms, repeat=count):
-                dp = {}
-                # 任意连续原子段也可以直接拼成一个数字，例如 91|78 -> 9178。
-                for start in range(count):
-                    for end in range(start + 1, count + 1):
-                        literal = "".join(sequence[start:end])
-                        dp[(start, end)] = {None: _ProofExpr.atom(literal)}
-
-                for span in range(2, count + 1):
-                    for start in range(count - span + 1):
-                        end = start + span
-                        literal = "".join(sequence[start:end])
-                        literal_expr = _ProofExpr.atom(literal)
-                        out = {(literal_expr.value, None): literal_expr}
-                        for split in range(start + 1, end):
-                            left_states = dp[(start, split)].values()
-                            right_states = dp[(split, end)].values()
-                            for left in left_states:
-                                for right in right_states:
-                                    for op in ("+", "-", "*", "/"):
-                                        candidate = _ProofExpr.combine(op, left, right)
-                                        if candidate is None:
-                                            continue
-                                        if abs(candidate.value) > self.value_limit:
-                                            continue
-                                        state_key = (candidate.value, candidate.op)
-                                        old = out.get(state_key)
-                                        if old is None or candidate.score() < old.score():
-                                            out[state_key] = candidate
-                        dp[(start, end)] = out
-
-                for expr in dp[(0, count)].values():
-                    bucket = cache.setdefault(expr.value, {})
-                    self._keep_best(bucket, expr)
+        for layer in bank.values():
+            for (value, kind, st, en), e in layer.items():
+                if st == "A" and en == "A":
+                    bucket = cache.setdefault(value, {})
+                    if _better(bucket.get(kind), e):
+                        bucket[kind] = e
+        self._augment_small(cache)
         return cache
 
-    def _augment_small_number_cache(self):
-        """用 1、6、7 的精确表达式补齐 0~90，避免小数值递归互相绕圈。"""
-        a91 = _ProofExpr.atom("91")
-        a78 = _ProofExpr.atom("78")
-        a13 = _ProofExpr.atom("13")
-        one = _ProofExpr.combine("/", _ProofExpr.combine("-", a91, a78), a13)
-        six = _ProofExpr.combine("/", a78, a13)
-        seven = _ProofExpr.combine("/", a91, a13)
-        zero = _ProofExpr.combine(
-            "-", _ProofExpr.combine("-", a91, a78), a13
-        )
-        units = (one, six, seven)
-        best = {0: {zero.op: zero}}
-
+    @staticmethod
+    def _augment_small(cache):
+        """保证 0~90 每个数都有表达式（用 13/13、78/13、91/13 累加补齐）。"""
+        a13, a78, a91 = (_Expr.leaf(x) for x in _ATOMS[::-1])
+        units = []
+        for num in (a13, a78, a91):
+            out = {}
+            _merge(out, num, a13, "/")
+            units.extend(out.values())
         for number in range(1, 91):
-            bucket = dict(self.exact_cache.get(number, {}))
+            bucket = cache.setdefault(number, {})
             for unit in units:
-                previous_number = number - unit.value
-                if previous_number < 0 or previous_number not in best:
-                    continue
-                for previous in best[previous_number].values():
-                    candidate = unit if previous_number == 0 else _ProofExpr.combine(
-                        "+", previous, unit
-                    )
-                    if candidate is not None and candidate.value == number:
-                        self._keep_best(bucket, candidate)
-            if bucket:
-                best[number] = bucket
-                self.exact_cache[number] = bucket
+                prev = cache.get(number - unit.value)
+                if prev and number - unit.value > 0:
+                    for p in list(prev.values()):
+                        _merge(bucket, p, unit, "+")
+        zero = {}
+        _merge(zero, a13, a13, "-")
+        cache.setdefault(0, {}).update(zero)
+        for number in [k for k, v in cache.items() if not v]:
+            del cache[number]
 
-    def _candidates_for(self, n):
-        n = int(n)
-        if n < 0:
-            raise ValueError("Only non-negative integers are supported")
+    @staticmethod
+    def _make_divisors(cache):
+        return [v for v in range(2, 4000)
+                if v in cache and min(e.length for e in cache[v].values()) <= 9]
 
-        if n in self.atom_values:
-            return {None: _ProofExpr.atom(self.atom_values[n])}
-        if n in self.memo:
-            return self.memo[n]
-        if n in self.exact_cache:
-            self.memo[n] = self.exact_cache[n]
-            return self.memo[n]
+    def _make_bases_and_anchors(self, cache):
+        """提取 5 字符以内的无括号紧凑乘积与字面量作为商余基底与邻近锚点（如 917*8、789*1）。"""
+        base_map = {v: (e.length, v, e) for v, e in self._aligned_lits if v <= 10 ** 6}
+        anchor_map = {v: e for v, e in self._aligned_lits}
+        for v, bucket in cache.items():
+            if v < 100:
+                continue
+            e = bucket.get("m")
+            if e is None or e.parens > 0 or e.hd or e.length > 5:
+                continue
+            if v <= 10 ** 6:
+                old = base_map.get(v)
+                if old is None or e.length < old[0]:
+                    base_map[v] = (e.length, v, e)
+            old_a = anchor_map.get(v)
+            if old_a is None or e.length < old_a.length:
+                anchor_map[v] = e
+        anchors = sorted(anchor_map.items(), key=lambda x: x[0])
+        return list(base_map.values()), anchors
 
-        candidates = {}
-        for base_text in self.atoms:
-            base = int(base_text)
-            base_expr = _ProofExpr.atom(base_text)
-            q, r = divmod(n, base)
+    def start_background(self):
+        """窗口显示后再补全 8 位对齐层，避免拖慢启动。"""
+        if self._enrich_started:
+            return
+        self._enrich_started = True
+        threading.Thread(target=self._enrich, daemon=True).start()
 
-            # 向下取整：n = base*q + r
+    def _enrich(self):
+        try:
+            if 8 in self._bank:
+                return
+            bank = dict(self._bank)
+            bank[8] = self._build_aligned_layer(
+                8, bank, pairs=((2, 6), (6, 2), (4, 4)), max_extra=1
+            )
+            self._bank = bank
+            self._refresh_tables(bank)
+            self.memo = {}      # 旧结果基于较浅的缓存，清空以获得更短表达式
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ 搜索
+    def _estimate(self, x, cache):
+        if x == 0:
+            return 0
+        hit = cache.get(x)
+        if hit:
+            return min(e.length for e in hit.values())
+        return 4 * len(str(x))
+
+    def _cands(self, n):
+        cache = self.exact_cache
+        hit = cache.get(n)
+        if hit:
+            return hit
+        hit = self.memo.get(n)
+        if hit:
+            return hit
+        if self._should_cancel is not None and self._should_cancel():
+            raise SolveCancelled()
+
+        out = {}
+        cands = self._cands
+
+        # 1. 邻近锚点：n = L ± d
+        window = 3000
+        lo = bisect_left(self._lit_values, n - window)
+        hi = bisect_right(self._lit_values, n + window)
+        for idx in range(lo, hi):
+            value, lit = self.literals[idx]
+            d = n - value
+            if d == 0:
+                continue
+            if d > 0:
+                for de in cands(d).values():
+                    _merge(out, lit, de, "+")
+            elif -d < n:
+                for de in cands(-d).values():
+                    _merge(out, lit, de, "-")
+
+        # 2. 因数分解：n = v * (n / v)，v 取表达式短的小数
+        if n < 10 ** 7:
+            for v in self._cheap_divisors:
+                if v * v > n:
+                    break
+                if n % v == 0:
+                    for ve in cands(v).values():
+                        for qe in cands(n // v).values():
+                            _merge(out, ve, qe, "*")
+                            _merge(out, qe, ve, "*")
+
+        # 3. 多基底商余 / 补数：n = b*q + r 或 b*(q+1) - gap
+        plans = []
+        for blen, b, _ in self.bases:
+            q, r = divmod(n, b)
             if q > 0:
-                for q_expr in self._candidates_for(q).values():
-                    product = _ProofExpr.combine("*", base_expr, q_expr)
-                    if product is None:
-                        continue
-                    if r == 0:
-                        self._keep_best(candidates, product)
-                    else:
-                        for r_expr in self._candidates_for(r).values():
-                            candidate = _ProofExpr.combine("+", product, r_expr)
-                            if candidate is not None and candidate.value == n:
-                                self._keep_best(candidates, candidate)
+                plans.append((blen + self._estimate(q, cache) + self._estimate(r, cache), b, q, r, False))
+            gap = (q + 1) * b - n if r else 0
+            if 0 < gap < n:
+                plans.append((blen + 2 + self._estimate(q + 1, cache) + self._estimate(gap, cache), b, q + 1, gap, True))
+        plans.sort(key=lambda p: p[0])
+        keep = 6 if n < 10 ** 6 else 4
+        base_expr = {b: e for _, b, e in self.bases}
+        for _, b, q, r, upward in plans[:keep]:
+            be = base_expr[b]
+            # q == 1 时乘积就是基底本身，无需再乘 1。
+            q_choices = (None,) if q == 1 else tuple(cands(q).values())
+            for qe in q_choices:
+                if qe is None:
+                    prod = {be.kind: be}
+                else:
+                    prod = {}
+                    _merge(prod, be, qe, "*")
+                if not prod:
+                    continue
+                if r == 0:
+                    for p in prod.values():
+                        if _better(out.get(p.kind), p):
+                            out[p.kind] = p
+                    continue
+                for re in cands(r).values():
+                    for p in prod.values():
+                        _merge(out, p, re, "-" if upward else "+")
 
-            # 向上取整：n = base*q_up - gap
-            q_up = q + (1 if r else 0)
-            gap = q_up * base - n
-            if gap > 0:
-                for q_expr in self._candidates_for(q_up).values():
-                    product = _ProofExpr.combine("*", base_expr, q_expr)
-                    if product is None:
-                        continue
-                    for gap_expr in self._candidates_for(gap).values():
-                        candidate = _ProofExpr.combine("-", product, gap_expr)
-                        if candidate is not None and candidate.value == n:
-                            self._keep_best(candidates, candidate)
-
-        if not candidates:
+        if not out:
             raise ValueError(f"无法构造数字 {n} 的表达式")
-        self.memo[n] = candidates
-        return candidates
+        self.memo[n] = out
+        return out
 
-    def solve(self, n):
+    # ------------------------------------------------------------ 对外
+    def solve(self, n, should_cancel=None):
         n = int(n)
         if n < 0:
             raise ValueError("请输入非负整数")
-        candidates = self._candidates_for(n)
-        best = min(candidates.values(), key=lambda expr: expr.score())
-        result = best.render()
-
-        # 最终安全校验：值正确，且数字串可完整拆分为给定原子。
-        if best.value != n or not self._is_atomic_sequence(result):
+        self._should_cancel = should_cancel
+        try:
+            best = min(self._cands(n).values(), key=lambda e: (e.length, e.parens))
+        finally:
+            self._should_cancel = None
+        text = best.render()
+        # 独立复核：AST 求值（逐步整除）必须等于 n，且去掉运算符后的数字流只含原子。
+        if self._evaluate(text) != n:
+            raise ValueError("内部校验失败：表达式求值与目标不符")
+        if not self._is_atomic_sequence(text):
             raise ValueError("内部校验失败：生成的表达式不符合原子规则")
-        return result
+        return text
 
     def _is_atomic_sequence(self, expr):
+        """去掉所有运算符/括号后，数字流必须恰好是 91、78、13 的顺序拼接。"""
         digits = "".join(ch for ch in expr if ch.isdigit())
-        if not digits:
-            return False
-        # 原子均为两位数，按顺序每两位验证即可。
-        if len(digits) % 2:
+        if not digits or len(digits) % 2:
             return False
         return all(digits[i:i + 2] in self.atoms for i in range(0, len(digits), 2))
 
     @staticmethod
     def _evaluate(expr):
-        """仅用于测试/校验内部表达式；除法节点必须得到整数。"""
-        import ast
-        from fractions import Fraction
+        """严格求值：按文本的左结合顺序计算，每个除法必须整除。"""
+        import ast  # 惰性导入：只在首次校验时付出代价，加快窗口启动
         tree = ast.parse(expr, mode="eval")
 
         def visit(node):
             if isinstance(node, ast.Expression):
                 return visit(node.body)
             if isinstance(node, ast.Constant) and type(node.value) is int:
-                return Fraction(node.value)
+                return node.value
             if isinstance(node, ast.BinOp):
                 a, b = visit(node.left), visit(node.right)
                 if isinstance(node.op, ast.Add):
@@ -636,12 +878,9 @@ class FinalArtAlgo:
                 if isinstance(node.op, ast.Mult):
                     return a * b
                 if isinstance(node.op, ast.Div):
-                    if b == 0:
-                        raise ValueError("division by zero")
-                    value = a / b
-                    if value.denominator != 1:
+                    if b == 0 or a % b:
                         raise ValueError("non-integer division")
-                    return value
+                    return a // b
             raise ValueError("unsupported expression")
 
         return visit(tree)
@@ -657,7 +896,7 @@ class FrierenGrimoire:
         self.root.configure(bg=CLR_BORDER)
 
         self.fonts = FontManager(self.root)
-        self.algo = FinalArtAlgo()
+        self.algo = None          # 在后台线程中构建，窗口不必等待
         self.current_formula = ""
         self._task = None
         self.typing_task = None
@@ -675,6 +914,7 @@ class FrierenGrimoire:
         self.root.minsize(600, 500)
 
         self.setup_ui()
+        self._start_worker()
         self.root.bind("<Escape>", lambda _event: self.root.destroy())
         self.root.bind("<Control-Return>", lambda _event: self.solve_logic())
         self.root.bind("<Configure>", self._on_configure)
@@ -743,12 +983,13 @@ class FrierenGrimoire:
         self.entry = SmoothNumericEntry(
             input_row, font=(self.fonts.mono, 23),
             bg=CLR_SURFACE, fg=CLR_PRIME, caret_color=CLR_ACCENT,
-            select_bg=CLR_ACCENT, select_fg=CLR_BG, height=58
+            select_bg=CLR_SELECT_BG, select_fg=CLR_PRIME, height=58
         )
         self.entry.pack(fill=tk.X, padx=16, pady=12)
         self.entry.bind("<<InputChanged>>", self.handle_input)
         self.entry.bind("<<Submit>>", lambda _event: self.solve_logic())
         self.entry.focus_set()
+        self.entry.copy_fallback = self.copy_formula
 
         # 轻量等号动效：输入时从水平转向竖直，保留原版的动态反馈。
         self.eq_canvas = tk.Canvas(
@@ -856,64 +1097,177 @@ class FrierenGrimoire:
         # 保留钩子供后续响应式布局使用；不做边缘检测或自动回弹。
         pass
 
+    # ------------------------------------------------------------ 状态栏
+    def _set_status(self, text, fg, remember=True):
+        self.status.configure(text=text, fg=fg)
+        if remember:
+            self._status_state = (text, fg)
+
+    # ------------------------------------------------------------ 后台求解
+    def _start_worker(self):
+        self._cv = threading.Condition()
+        self._req = None
+        self._req_id = 0
+        self._done_id = 0
+        self._results = queue.SimpleQueue()
+        self._poll_job = None
+        self._busy_job = None
+        self._status_state = ("Ready · Enter a number to begin", CLR_MUTED)
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        algo = FinalArtAlgo()
+        self.algo = algo
+        enriched = False
+        while True:
+            with self._cv:
+                if self._req is None and not enriched:
+                    self._cv.wait(timeout=0.20)
+                if self._req is None and not enriched:
+                    enriched = True
+                    need_enrich = True
+                else:
+                    need_enrich = False
+                    while self._req is None:
+                        self._cv.wait()
+                    req_id, number = self._req
+                    self._req = None
+            if need_enrich:
+                algo._enrich()
+                continue
+
+            def stale(rid=req_id):
+                # 有更新的输入到来时，立刻放弃当前搜索。
+                return self._req is not None or rid != self._req_id
+
+            t0 = time.perf_counter()
+            try:
+                formula = algo.solve(number, should_cancel=stale)
+                self._results.put((req_id, formula, None, (time.perf_counter() - t0) * 1000))
+            except SolveCancelled:
+                continue
+            except Exception as exc:
+                self._results.put((req_id, None, str(exc), 0.0))
+
+    def _submit(self, number):
+        self._req_id += 1
+        with self._cv:
+            self._req = (self._req_id, number)
+            self._cv.notify()
+        if self._busy_job is None:
+            self._busy_job = self.root.after(160, self._show_busy)
+        if self._poll_job is None:
+            self._poll_job = self.root.after(8, self._poll_results)
+
+    def _cancel_pending(self):
+        self._req_id += 1
+        self._done_id = self._req_id
+        with self._cv:
+            self._req = None
+        if self._busy_job is not None:
+            self.root.after_cancel(self._busy_job)
+            self._busy_job = None
+
+    def _show_busy(self):
+        self._busy_job = None
+        if self._done_id != self._req_id:
+            self._set_status("Searching…", CLR_MUTED, remember=False)
+
+    def _poll_results(self):
+        self._poll_job = None
+        result = None
+        while True:
+            try:
+                item = self._results.get_nowait()
+            except queue.Empty:
+                break
+            if item[0] == self._req_id:
+                result = item
+        if result is not None:
+            req_id, formula, error, ms = result
+            self._done_id = req_id
+            if self._busy_job is not None:
+                self.root.after_cancel(self._busy_job)
+                self._busy_job = None
+            if error:
+                self.current_formula = ""
+                self._show_formula("")
+                self._set_status(error, CLR_ACCENT)
+            else:
+                self.current_formula = formula
+                self._animate_formula(formula)
+                took = f"{ms:.0f} ms" if ms >= 1 else "<1 ms"
+                self._set_status(
+                    f"Constructed · {len(formula)} characters · {took}", CLR_ACCENT
+                )
+        if self._done_id != self._req_id:
+            self._poll_job = self.root.after(10, self._poll_results)
+
+    # ------------------------------------------------------------ 输入
+    @staticmethod
+    def _digits(text):
+        return "".join(ch for ch in text if ch.isdigit())
+
     def handle_input(self, _event=None):
-        raw = "".join(ch for ch in self.entry.get() if ch.isdigit())
+        raw = self._digits(self.entry.get())
         self.eq_target = 90.0 if raw else 0.0
+        self._start_eq()
         if self._task:
             self.root.after_cancel(self._task)
-        self._task = self.root.after(110, self.solve_logic)
+        # 求解在后台线程，防抖只需很短，输入几乎实时出结果。
+        self._task = self.root.after(35, self.solve_logic)
 
     def solve_logic(self):
         if self._task:
             self.root.after_cancel(self._task)
             self._task = None
+
+        raw = self._digits(self.entry.get())
+        if not raw:
+            self._cancel_pending()
+            self.current_formula = ""
+            self._show_formula("")
+            self._set_status("Ready · Enter a number to begin", CLR_MUTED)
+            self.eq_target = 0.0
+            self._start_eq()
+            return
+        if len(raw) > 15:
+            self._cancel_pending()
+            self.current_formula = ""
+            self._show_formula("")
+            self._set_status("Please enter at most 15 digits.", CLR_ACCENT)
+            return
+        self._submit(int(raw))
+
+    # ------------------------------------------------------------ 结果显示
+    def _stop_typing(self):
+        self.type_generation += 1
         if self.typing_task:
             self.root.after_cancel(self.typing_task)
             self.typing_task = None
 
-        raw = "".join(ch for ch in self.entry.get() if ch.isdigit())
-        if not raw:
-            self.current_formula = ""
-            self._show_formula("")
-            self.status.configure(text="Ready · Enter a number to begin", fg=CLR_MUTED)
-            self.eq_target = 0.0
-            return
-
-        try:
-            if len(raw) > 15:
-                raise ValueError("Please enter at most 15 digits.")
-            number = int(raw)
-            formula = self.algo.solve(number)
-            self.current_formula = formula
-            self._animate_formula(formula)
-            self.status.configure(
-                text=f"Constructed · {len(formula)} characters",
-                fg=CLR_ACCENT
-            )
-        except Exception as exc:
-            self.current_formula = ""
-            self._show_formula("")
-            self.status.configure(text=str(exc), fg=CLR_ACCENT)
+    def _set_result_text(self, text):
+        self._scroll_target = 0.0
+        self.res_txt.yview_moveto(0.0)
+        self.res_txt.configure(state=tk.NORMAL)
+        self.res_txt.delete("1.0", tk.END)
+        if text:
+            self.res_txt.insert(tk.END, text, "formula")
+        self.res_txt.configure(state=tk.DISABLED)
 
     def _show_formula(self, formula):
-        self._scroll_target = 0.0
-        self.res_txt.yview_moveto(0.0)
-        self.res_txt.configure(state=tk.NORMAL)
-        self.res_txt.delete("1.0", tk.END)
-        if formula:
-            self.res_txt.insert(tk.END, formula, "formula")
-        self.res_txt.configure(state=tk.DISABLED)
+        self._stop_typing()
+        self._set_result_text(formula)
 
     def _animate_formula(self, formula):
-        """逐段显影：短表达式更快，长表达式按块出现，避免动画拖沓。"""
-        self._scroll_target = 0.0
-        self.res_txt.yview_moveto(0.0)
-        self.type_generation += 1
+        """短表达式直接显示；长表达式约 10 帧内显影完毕，不拖慢连续输入。"""
+        self._stop_typing()
+        if len(formula) <= 16:
+            self._set_result_text(formula)
+            return
         generation = self.type_generation
-        self.res_txt.configure(state=tk.NORMAL)
-        self.res_txt.delete("1.0", tk.END)
-        self.res_txt.configure(state=tk.DISABLED)
-        step = max(1, min(5, len(formula) // 55 + 1))
+        self._set_result_text("")
+        step = -(-len(formula) // 10)
 
         def reveal(index=0):
             if generation != self.type_generation:
@@ -923,25 +1277,30 @@ class FrierenGrimoire:
             self.res_txt.insert(tk.END, formula[index:end], "formula")
             self.res_txt.configure(state=tk.DISABLED)
             if end < len(formula):
-                self.typing_task = self.root.after(12, lambda: reveal(end))
+                self.typing_task = self.root.after(14, lambda: reveal(end))
             else:
                 self.typing_task = None
 
         reveal()
 
+    # ------------------------------------------------------------ 等号动效
+    def _start_eq(self):
+        if self.anim_task is None:
+            self._animate_eq()
+
     def _animate_eq(self):
-        # 平滑缓动，不做窗口尺寸/位置回弹。
+        # 平滑缓动；到位后停止调度，空闲时不再占用 CPU。
         delta = self.eq_target - self.eq_angle
         if abs(delta) > 0.12:
             self.eq_angle += delta * 0.20
         else:
             self.eq_angle = self.eq_target
 
-        angle = self.eq_angle * 3.141592653589793 / 180.0
+        angle = math.radians(self.eq_angle)
         cx, cy = 36, 21
         half = 12
         offset = 4.5
-        cos_a, sin_a = __import__("math").cos(angle), __import__("math").sin(angle)
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
 
         def line_points(side):
             ox, oy = -side * offset * sin_a, side * offset * cos_a
@@ -950,14 +1309,28 @@ class FrierenGrimoire:
 
         self.eq_canvas.coords(self.eq_line_a, *line_points(-1))
         self.eq_canvas.coords(self.eq_line_b, *line_points(1))
-        self.anim_task = self.root.after(16, self._animate_eq)
+        if self.eq_angle != self.eq_target:
+            self.anim_task = self.root.after(16, self._animate_eq)
+        else:
+            self.anim_task = None
 
+    # ------------------------------------------------------------ 复制
     def copy_formula(self, _event=None):
         if not self.current_formula:
             return
         self.root.clipboard_clear()
         self.root.clipboard_append(self.current_formula)
-        self.status.configure(text="Copied to clipboard", fg=CLR_ACCENT)
+        self._set_status("Copied to clipboard ✓", CLR_ACCENT, remember=False)
+        self.copy_button.configure(text="Copied! ✓", fg=CLR_ACCENT)
+        if getattr(self, "_copy_reset_job", None):
+            self.root.after_cancel(self._copy_reset_job)
+        self._copy_reset_job = self.root.after(1500, self._reset_copy_feedback)
+
+    def _reset_copy_feedback(self):
+        self._copy_reset_job = None
+        self.copy_button.configure(text="Copy  ↗", fg=CLR_PRIME)
+        text, fg = self._status_state
+        self.status.configure(text=text, fg=fg)
 
 
 if __name__ == "__main__":
